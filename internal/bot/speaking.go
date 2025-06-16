@@ -20,6 +20,8 @@ type SpeakingBot struct {
 	voiceConn     map[string]*discordgo.VoiceConnection // guildID -> VoiceConnection
 	audioChannels map[string]chan []byte                // ★ ギルドごとのOpusデータチャネル (guildID -> channel)
 	channelsMutex sync.Mutex                            // ★ audioChannelsアクセス用のmutex
+	guildEffects  map[string]AudioEffect                // ★ ギルドごとのエフェクト設定 (guildID -> effect)
+	effectsMutex  sync.Mutex                            // ★ guildEffectsアクセス用のmutex
 	stopChan      chan struct{}
 }
 
@@ -44,17 +46,23 @@ func NewSpeakingBot(token string, listeningBot *ListeningBot) (*SpeakingBot, err
 		listeningBot:  listeningBot, // ★ ListeningBotをセット
 		voiceConn:     make(map[string]*discordgo.VoiceConnection),
 		audioChannels: make(map[string]chan []byte), // ★ ギルドごとのチャネルマップ
+		guildEffects:  make(map[string]AudioEffect), // ★ ギルドごとのエフェクトマップ
 		stopChan:      make(chan struct{}),
 	}
 
-	// メッセージハンドラを登録
-	session.AddHandler(bot.messageHandler)
+	// メッセージハンドラはCommandRouterで管理されるため、ここでは登録しない
+	// インタラクションハンドラーのみ登録
 	session.AddHandler(bot.interactionHandler)
 
 	// ★ audioProcessor.AddListener は削除 (handleSpeakCommand で Register する)
 	// audioProcessor.AddListener(audioChannel)
 
 	return bot, nil
+}
+
+// GetSession は、Discordセッションを取得します（公開メソッド）
+func (b *SpeakingBot) GetSession() *discordgo.Session {
+	return b.session
 }
 
 // Start は、Botを起動します
@@ -110,6 +118,48 @@ func (b *SpeakingBot) Stop() {
 	// セッションを閉じる
 	b.session.Close()
 	log.Println("[SpeakingBot] Stopped.")
+}
+
+// HasConnection は、指定されたギルドIDに接続があるかチェックします
+func (b *SpeakingBot) HasConnection(guildID string) bool {
+	_, exists := b.voiceConn[guildID]
+	return exists
+}
+
+// SetEffect は、指定されたギルドIDにエフェクトを設定します
+func (b *SpeakingBot) SetEffect(guildID string, effect AudioEffect) {
+	b.effectsMutex.Lock()
+	defer b.effectsMutex.Unlock()
+	b.guildEffects[guildID] = effect
+	log.Printf("[SpeakingBot:%s] Effect set to: %d", guildID, effect)
+}
+
+// GetEffect は、指定されたギルドIDのエフェクトを取得します
+func (b *SpeakingBot) GetEffect(guildID string) AudioEffect {
+	b.effectsMutex.Lock()
+	defer b.effectsMutex.Unlock()
+	if effect, exists := b.guildEffects[guildID]; exists {
+		return effect
+	}
+	return EffectNone // デフォルトは通常
+}
+
+// SetEffectByName は、エフェクト名でエフェクトを設定します
+func (b *SpeakingBot) SetEffectByName(guildID, effectName string) {
+	var effect AudioEffect
+	switch effectName {
+	case "ビットクラッシュ":
+		effect = EffectBitcrush
+	case "ローパスフィルター":
+		effect = EffectLowpass
+	case "エコー":
+		effect = EffectEcho
+	case "ヘリウム声":
+		effect = EffectHelium
+	default:
+		effect = EffectNone
+	}
+	b.SetEffect(guildID, effect)
 }
 
 // messageHandler は、メッセージを処理します
@@ -216,14 +266,28 @@ func (b *SpeakingBot) showAudioEffectSelector(s *discordgo.Session, m *discordgo
 
 // interactionHandler は、インタラクション（セレクトメニューなど）を処理します
 func (b *SpeakingBot) interactionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	log.Printf("[SpeakingBot] Received interaction: Type=%d", i.Type)
+
 	// セレクトメニューの場合
 	if i.Type == discordgo.InteractionMessageComponent {
 		data := i.MessageComponentData()
+		log.Printf("[SpeakingBot] Processing interaction with CustomID: %s", data.CustomID)
 
 		// 音声エフェクト選択の場合（t!speak用）
 		if data.CustomID == "audio_effect_select_speak" {
+			log.Printf("[SpeakingBot] Handling audio effect selection")
 			b.handleEffectSelection(s, i)
+			return
 		}
+
+		// SpeakingBotのチャンネル選択を処理（t!speak用）
+		if strings.HasPrefix(data.CustomID, "channel_select_speak_") {
+			log.Printf("[SpeakingBot] Handling t!speak channel selection")
+			b.handleChannelSelectionForSpeak(s, i)
+			return
+		}
+
+		log.Printf("[SpeakingBot] No matching handler for CustomID: %s", data.CustomID)
 	}
 }
 
@@ -246,32 +310,26 @@ func (b *SpeakingBot) handleEffectSelection(s *discordgo.Session, i *discordgo.I
 	}
 
 	selectedValue := data.Values[0]
-	var selectedEffect AudioEffect
 	var effectName string
 
 	switch selectedValue {
 	case "effect_none":
-		selectedEffect = EffectNone
 		effectName = "通常"
 	case "effect_bitcrush":
-		selectedEffect = EffectBitcrush
 		effectName = "ビットクラッシュ"
 	case "effect_lowpass":
-		selectedEffect = EffectLowpass
 		effectName = "ローパスフィルター"
 	case "effect_echo":
-		selectedEffect = EffectEcho
 		effectName = "エコー"
 	case "effect_helium":
-		selectedEffect = EffectHelium
 		effectName = "ヘリウム声"
 	default:
-		selectedEffect = EffectNone
 		effectName = "通常"
 	}
 
 	// ListeningBotにエフェクト設定を通知
-	b.listeningBot.audioMixer.SetAudioEffect(guildID, selectedEffect)
+	// エフェクトを設定（現在の実装では個別設定は不要）
+	log.Printf("[SpeakingBot:%s] Selected effect: %s", guildID, effectName)
 
 	// セレクトメニューを削除してエフェクト選択結果メッセージに置き換え
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -284,30 +342,179 @@ func (b *SpeakingBot) handleEffectSelection(s *discordgo.Session, i *discordgo.I
 		},
 	})
 
-	// ボイスチャンネルに接続
+	// チャンネル選択メニューを表示
 	go func() {
-		success := b.connectToVoiceChannel(s, guildID, i.Member.User.ID)
-
-		// 接続結果を元のメッセージに反映
-		var finalContent string
-		if success {
-			finalContent = fmt.Sprintf("✅ **天の声ボット接続完了**\n"+
-				"選択されたエフェクト: **%s**\n"+
-				"音声の再生を開始しました！", effectName)
-		} else {
-			finalContent = fmt.Sprintf("❌ **接続エラー**\n"+
-				"選択されたエフェクト: **%s**\n"+
-				"ボイスチャンネルへの接続に失敗しました。", effectName)
-		}
-
-		// メッセージを最終的な状態に更新
-		_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-			Content: &finalContent,
-		})
-		if err != nil {
-			log.Printf("[SpeakingBot] Error updating interaction message: %v", err)
-		}
+		// 少し待ってからフォローアップメッセージでチャンネル選択メニューを表示
+		time.Sleep(500 * time.Millisecond)
+		b.showChannelSelectorForSpeak(s, i, effectName)
 	}()
+}
+
+// showChannelSelectorForSpeak は、SpeakingBot用のボイスチャンネル選択メニューを表示します
+func (b *SpeakingBot) showChannelSelectorForSpeak(s *discordgo.Session, i *discordgo.InteractionCreate, effectName string) {
+	guildID := i.GuildID
+
+	// ギルド情報を取得
+	guild, err := s.State.Guild(guildID)
+	if err != nil {
+		log.Printf("[SpeakingBot:%s] Error getting guild: %v", guildID, err)
+		s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+			Content: "❌ **エラー**\nサーバー情報の取得に失敗しました。",
+		})
+		return
+	}
+
+	// ボイスチャンネルを取得
+	var voiceChannels []*discordgo.Channel
+	for _, channel := range guild.Channels {
+		if channel.Type == discordgo.ChannelTypeGuildVoice {
+			voiceChannels = append(voiceChannels, channel)
+		}
+	}
+
+	if len(voiceChannels) == 0 {
+		s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+			Content: "❌ **エラー**\nこのサーバーにはボイスチャンネルがありません。",
+		})
+		return
+	}
+
+	// セレクトメニューのオプションを作成
+	var options []discordgo.SelectMenuOption
+	for _, channel := range voiceChannels {
+		// チャンネル内のユーザー数を取得
+		userCount := 0
+		for _, vs := range guild.VoiceStates {
+			if vs.ChannelID == channel.ID {
+				userCount++
+			}
+		}
+
+		description := fmt.Sprintf("👥 %d人", userCount)
+		if userCount == 0 {
+			description = "空のチャンネル"
+		}
+
+		options = append(options, discordgo.SelectMenuOption{
+			Label:       channel.Name,
+			Value:       fmt.Sprintf("speak_%s", channel.ID),
+			Description: description,
+			Emoji: &discordgo.ComponentEmoji{
+				Name: "🔊",
+			},
+		})
+	}
+
+	// セレクトメニューコンポーネントを作成
+	selectMenu := discordgo.SelectMenu{
+		CustomID:    fmt.Sprintf("channel_select_speak_%s_%s_%s", guildID, i.Member.User.ID, effectName),
+		Placeholder: "接続するボイスチャンネルを選択してください",
+		Options:     options,
+		MinValues:   &[]int{1}[0],
+		MaxValues:   1,
+	}
+
+	// フォローアップメッセージを送信
+	_, err = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+		Content: fmt.Sprintf("🔊 **SpeakingBot - チャンネル選択**\n選択されたエフェクト: **%s**\n音声を再生するボイスチャンネルを選択してください：", effectName),
+		Components: []discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{selectMenu},
+			},
+		},
+	})
+
+	if err != nil {
+		log.Printf("[SpeakingBot:%s] Error sending channel selector: %v", guildID, err)
+		s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+			Content: "❌ **エラー**\nチャンネル選択メニューの表示に失敗しました。",
+		})
+	}
+}
+
+// handleChannelSelectionForSpeak は、SpeakingBot用のチャンネル選択を処理します
+func (b *SpeakingBot) handleChannelSelectionForSpeak(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	log.Printf("[SpeakingBot] handleChannelSelectionForSpeak: Starting channel selection processing")
+
+	data := i.MessageComponentData()
+	guildID := i.GuildID
+
+	log.Printf("[SpeakingBot:%s] Processing channel selection with %d values", guildID, len(data.Values))
+
+	// 選択されたチャンネルIDを取得
+	if len(data.Values) == 0 {
+		log.Printf("[SpeakingBot:%s] No values selected", guildID)
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "❌ **エラー**\nチャンネルが選択されていません。",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
+	selectedValue := data.Values[0]
+	log.Printf("[SpeakingBot:%s] Selected value: %s", guildID, selectedValue)
+
+	if len(selectedValue) < 6 || selectedValue[:6] != "speak_" {
+		log.Printf("[SpeakingBot:%s] Invalid selection format: %s", guildID, selectedValue)
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "❌ **エラー**\n無効な選択です。",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
+	channelID := selectedValue[6:] // "speak_"を除去
+	log.Printf("[SpeakingBot:%s] Extracted channelID: %s", guildID, channelID)
+
+	// CustomIDからエフェクト名を抽出
+	customIDParts := strings.Split(data.CustomID, "_")
+	effectName := "通常"
+	if len(customIDParts) >= 5 {
+		effectName = customIDParts[4] // channel_select_speak_guildID_userID_effectName
+	}
+
+	// インタラクションに応答
+	log.Printf("[SpeakingBot:%s] Responding to interaction", guildID)
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: fmt.Sprintf("🔊 **SpeakingBot接続中...**\n選択されたエフェクト: **%s**\n選択されたチャンネルに接続しています...", effectName),
+		},
+	})
+	if err != nil {
+		log.Printf("[SpeakingBot:%s] Error responding to interaction: %v", guildID, err)
+		return
+	}
+
+	// ボイスチャンネルに接続
+	log.Printf("[SpeakingBot:%s] Attempting to connect to voice channel: %s", guildID, channelID)
+	success := b.ConnectToVoiceChannelByID(s, guildID, channelID)
+
+	// 結果をフォローアップメッセージで送信
+	var followupContent string
+	if success {
+		followupContent = fmt.Sprintf("✅ **SpeakingBot接続完了**\n選択されたエフェクト: **%s**\n音声の再生を開始しました！", effectName)
+		log.Printf("[SpeakingBot:%s] Successfully connected to voice channel %s", guildID, channelID)
+	} else {
+		followupContent = fmt.Sprintf("❌ **接続エラー**\n選択されたエフェクト: **%s**\nボイスチャンネルへの接続に失敗しました。", effectName)
+		log.Printf("[SpeakingBot:%s] Failed to connect to voice channel %s", guildID, channelID)
+	}
+
+	log.Printf("[SpeakingBot:%s] Sending followup message", guildID)
+	_, err = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+		Content: followupContent,
+	})
+	if err != nil {
+		log.Printf("[SpeakingBot:%s] Error sending followup message: %v", guildID, err)
+	}
+
+	log.Printf("[SpeakingBot:%s] handleChannelSelectionForSpeak completed", guildID)
 }
 
 // ConnectToVoiceChannel は、ボイスチャンネルへの接続処理を行います（公開メソッド）
@@ -348,7 +555,7 @@ func (b *SpeakingBot) connectToVoiceChannel(s *discordgo.Session, guildID, userI
 
 	// ボイスチャンネルに接続
 	log.Printf("[SpeakingBot:%s] Joining voice channel %s", guildID, userVoiceState.ChannelID)
-	conn, err := s.ChannelVoiceJoin(guildID, userVoiceState.ChannelID, true, false) // Mute=true, Deaf=false
+	conn, err := s.ChannelVoiceJoin(guildID, userVoiceState.ChannelID, false, true) // Mute=false, Deaf=true
 	if err != nil {
 		log.Printf("[SpeakingBot:%s] Error joining voice channel: %v", guildID, err)
 		return false
@@ -413,7 +620,7 @@ func (b *SpeakingBot) connectToVoiceChannelByID(s *discordgo.Session, guildID, c
 
 	// ボイスチャンネルに接続
 	log.Printf("[SpeakingBot:%s] Joining voice channel %s", guildID, channelID)
-	conn, err := s.ChannelVoiceJoin(guildID, channelID, true, false) // Mute=true, Deaf=false
+	conn, err := s.ChannelVoiceJoin(guildID, channelID, false, true) // Mute=false, Deaf=true
 	if err != nil {
 		log.Printf("[SpeakingBot:%s] Error joining voice channel: %v", guildID, err)
 		return false
@@ -512,10 +719,17 @@ func (b *SpeakingBot) playAudioLoop(vc *discordgo.VoiceConnection, audioChannel 
 
 			// 音声データがあれば再生
 			if len(audioData) > 0 {
+				// Speaking状態を開始
+				vc.Speaking(true)
+
 				// 音声データをOpusフレームに変換して送信
 				// discordgoでは、Opusフレームをそのまま送信できる
 				// log.Printf("[SpeakingBot:%s] Sending Opus data to voice channel (Size: %d)", vc.GuildID, len(audioData)) // コメントアウト
 				vc.OpusSend <- audioData
+
+				// 短い遅延の後、Speaking状態を停止
+				time.Sleep(20 * time.Millisecond)
+				vc.Speaking(false)
 			}
 		}
 	}

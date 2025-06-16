@@ -123,6 +123,14 @@ func main() {
 	// 相互参照を設定
 	listeningBot.SetSpeakingBot(speakingBot)
 
+	// コマンドルーターを作成
+	log.Println("[SYSTEM] コマンドルーターを作成中...")
+	commandRouter := bot.NewCommandRouter(listeningBot, speakingBot)
+	// メッセージハンドラーをListeningBotのセッションにのみ登録
+	// （CommandRouter内で両方のセッションにアクセス可能）
+	listeningBot.GetSession().AddHandler(commandRouter.HandleMessage)
+	log.Println("[SYSTEM] コマンドハンドラーをListeningBotセッションに登録しました")
+
 	// Botを起動
 	log.Println("[SYSTEM] リスニングBotを起動中...")
 	err = listeningBot.Start()

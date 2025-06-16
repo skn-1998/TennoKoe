@@ -10,330 +10,290 @@ import (
 
 // AudioMixer は音声ミキシング処理を管理します
 type AudioMixer struct {
-	// PCMバッファ
-	pcmBuffer   map[uint32][]int16 // SSRC -> PCM data buffer
-	bufferMutex sync.Mutex
+	// PCMバッファ（ギルドごと）
+	pcmBuffers      map[string]map[uint32][]int16 // guildID -> ssrc -> PCM buffer
+	pcmBuffersMutex sync.Mutex
 
-	// アクティブなギルドとSSRCの管理
-	activeGuildSSRC  map[string]map[uint32]bool // guildID -> SSRC set
-	activeGuildMutex sync.Mutex
-
-	// Speaking チャンネル管理
-	speakingChannels      map[string]chan []byte // guildID -> SpeakingBotへのOpusデータチャネル
+	// SpeakingBotへの出力チャネル（ギルドごと）
+	speakingChannels      map[string]chan []byte // guildID -> Opus data channel
 	speakingChannelsMutex sync.Mutex
 
-	// エフェクトプロセッサ
+	// ミキサーループ制御
+	stopMixer chan bool
+	running   bool
+	runMutex  sync.Mutex
+
+	// Opusエンコーダー（ギルドごと）
+	encoders      map[string]*gopus.Encoder
+	encodersMutex sync.Mutex
+
+	// エフェクトプロセッサー
 	effectProcessor *AudioEffectProcessor
 
-	// ミキサー制御
-	stopMixer chan struct{}
+	// SpeakingBotへの参照（エフェクト設定取得用）
+	speakingBot *SpeakingBot
+
+	// ログ制限用カウンター
+	logCounter map[string]int
+	logMutex   sync.Mutex
 }
 
 // NewAudioMixer は新しいAudioMixerを作成します
-func NewAudioMixer() *AudioMixer {
+func NewAudioMixer(speakingBot *SpeakingBot) *AudioMixer {
 	return &AudioMixer{
-		pcmBuffer:        make(map[uint32][]int16),
-		activeGuildSSRC:  make(map[string]map[uint32]bool),
+		pcmBuffers:       make(map[string]map[uint32][]int16),
 		speakingChannels: make(map[string]chan []byte),
+		encoders:         make(map[string]*gopus.Encoder),
+		stopMixer:        make(chan bool),
+		running:          false,
 		effectProcessor:  NewAudioEffectProcessor(),
-		stopMixer:        make(chan struct{}),
+		speakingBot:      speakingBot,
+		logCounter:       make(map[string]int),
 	}
 }
 
-// Start はミキサーを開始します
+// SetSpeakingBot は、SpeakingBotの参照を設定します
+func (m *AudioMixer) SetSpeakingBot(speakingBot *SpeakingBot) {
+	m.speakingBot = speakingBot
+}
+
+// Start はミキサーループを開始します
 func (m *AudioMixer) Start() {
-	go m.startMixer()
-}
+	m.runMutex.Lock()
+	defer m.runMutex.Unlock()
 
-// Stop はミキサーを停止します
-func (m *AudioMixer) Stop() {
-	log.Println("[AudioMixer] Stopping mixer...")
-	close(m.stopMixer)
-}
-
-// AddPCMData はPCMデータをバッファに追加します
-func (m *AudioMixer) AddPCMData(ssrc uint32, pcmData []int16) {
-	if len(pcmData) == 0 {
+	if m.running {
 		return
 	}
 
-	m.bufferMutex.Lock()
-	m.pcmBuffer[ssrc] = append(m.pcmBuffer[ssrc], pcmData...)
-	m.bufferMutex.Unlock()
+	m.running = true
+	go m.mixerLoop()
+	log.Println("[AudioMixer] Mixer loop started")
 }
 
-// TrackSSRC はギルドでアクティブなSSRCを記録します
-func (m *AudioMixer) TrackSSRC(guildID string, ssrc uint32) {
-	m.activeGuildMutex.Lock()
-	defer m.activeGuildMutex.Unlock()
-	if _, ok := m.activeGuildSSRC[guildID]; !ok {
-		m.activeGuildSSRC[guildID] = make(map[uint32]bool)
+// Stop はミキサーループを停止します
+func (m *AudioMixer) Stop() {
+	m.runMutex.Lock()
+	defer m.runMutex.Unlock()
+
+	if !m.running {
+		return
 	}
-	m.activeGuildSSRC[guildID][ssrc] = true
+
+	m.running = false
+	m.stopMixer <- true
+	log.Println("[AudioMixer] Mixer loop stopped")
 }
 
-// RegisterSpeakingChannel は、指定されたギルドIDにSpeakingBotのチャネルを登録します
+// RegisterSpeakingChannel は指定されたギルドIDにSpeakingBotのチャネルを登録します
 func (m *AudioMixer) RegisterSpeakingChannel(guildID string, ch chan []byte) {
 	m.speakingChannelsMutex.Lock()
 	defer m.speakingChannelsMutex.Unlock()
-	// 古いチャネルがあれば閉じる (念のため)
-	if oldCh, exists := m.speakingChannels[guildID]; exists {
-		close(oldCh)
-	}
+
 	m.speakingChannels[guildID] = ch
-	log.Printf("[AudioMixer:%s] Registered speaking channel", guildID)
+	log.Printf("[AudioMixer:%s] Speaking channel registered", guildID)
 }
 
-// UnregisterSpeakingChannel は、指定されたギルドIDのSpeakingBotチャネルを解除し閉じます
+// UnregisterSpeakingChannel は指定されたギルドIDのSpeakingBotチャネルを解除し閉じます
 func (m *AudioMixer) UnregisterSpeakingChannel(guildID string) {
 	m.speakingChannelsMutex.Lock()
 	defer m.speakingChannelsMutex.Unlock()
+
 	if ch, exists := m.speakingChannels[guildID]; exists {
+		close(ch)
 		delete(m.speakingChannels, guildID)
-
-		// チャンネルを安全に閉じる
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("[AudioMixer:%s] Speaking channel was already closed during unregistration", guildID)
-				}
-			}()
-
-			if ch != nil {
-				close(ch)
-				log.Printf("[AudioMixer:%s] Unregistered and closed speaking channel", guildID)
-			}
-		}()
-	} else {
-		log.Printf("[AudioMixer:%s] Attempted to unregister non-existent speaking channel", guildID)
+		log.Printf("[AudioMixer:%s] Speaking channel unregistered and closed", guildID)
 	}
 }
 
-// SetAudioEffect は音声エフェクトを設定します
-func (m *AudioMixer) SetAudioEffect(guildID string, effect AudioEffect) {
-	m.effectProcessor.SetAudioEffect(guildID, effect)
-}
-
-// HasSpeakingChannel は指定されたギルドにSpeakingChannelが存在するかチェックします
+// HasSpeakingChannel は指定されたギルドIDにSpeakingBotチャネルが登録されているかチェックします
 func (m *AudioMixer) HasSpeakingChannel(guildID string) bool {
 	m.speakingChannelsMutex.Lock()
 	defer m.speakingChannelsMutex.Unlock()
+
 	_, exists := m.speakingChannels[guildID]
 	return exists
 }
 
-// CleanupGuildResources は、特定のギルドに関連するすべてのリソースをクリーンアップします
+// AddPCMData は指定されたギルドとSSRCにPCMデータを追加します
+func (m *AudioMixer) AddPCMData(guildID string, ssrc uint32, pcmData []int16) {
+	m.pcmBuffersMutex.Lock()
+	defer m.pcmBuffersMutex.Unlock()
+
+	if m.pcmBuffers[guildID] == nil {
+		m.pcmBuffers[guildID] = make(map[uint32][]int16)
+	}
+
+	m.pcmBuffers[guildID][ssrc] = append(m.pcmBuffers[guildID][ssrc], pcmData...)
+}
+
+// CleanupGuildResources は指定されたギルドのリソースをクリーンアップします
 func (m *AudioMixer) CleanupGuildResources(guildID string) {
-	log.Printf("[AudioMixer:%s] Cleaning up all resources for guild", guildID)
+	// PCMバッファをクリーンアップ
+	m.pcmBuffersMutex.Lock()
+	delete(m.pcmBuffers, guildID)
+	m.pcmBuffersMutex.Unlock()
 
-	// アクティブなSSRCを取得してクリーンアップ
-	m.activeGuildMutex.Lock()
-	var ssrcsToClean []uint32
-	if activeSSRCs, ok := m.activeGuildSSRC[guildID]; ok {
-		for ssrc := range activeSSRCs {
-			ssrcsToClean = append(ssrcsToClean, ssrc)
-		}
-		delete(m.activeGuildSSRC, guildID)
-	}
-	m.activeGuildMutex.Unlock()
+	// エンコーダーをクリーンアップ
+	m.encodersMutex.Lock()
+	delete(m.encoders, guildID)
+	m.encodersMutex.Unlock()
 
-	if len(ssrcsToClean) > 0 {
-		m.cleanupUserResources(ssrcsToClean...)
-	}
-
-	// Speakingチャンネルもクリーンアップ
-	m.UnregisterSpeakingChannel(guildID)
-
-	// エフェクト状態もクリーンアップ
-	m.effectProcessor.CleanupGuildEffects(guildID)
+	log.Printf("[AudioMixer:%s] Guild resources cleaned up", guildID)
 }
 
-// CleanupUserResources は、指定されたSSRCリストに関連するPCMバッファをクリーンアップします
-func (m *AudioMixer) CleanupUserResources(ssrcs ...uint32) {
-	m.cleanupUserResources(ssrcs...)
-}
+// CleanupUserResources は指定されたSSRCのリソースをクリーンアップします
+func (m *AudioMixer) CleanupUserResources(guildID string, ssrcs ...uint32) {
+	m.pcmBuffersMutex.Lock()
+	defer m.pcmBuffersMutex.Unlock()
 
-// cleanupUserResources は、指定されたSSRCリストに関連するPCMバッファをクリーンアップします
-func (m *AudioMixer) cleanupUserResources(ssrcs ...uint32) {
-	m.bufferMutex.Lock()
-	defer m.bufferMutex.Unlock()
-
-	cleanedCount := 0
-	for _, ssrc := range ssrcs {
-		if _, ok := m.pcmBuffer[ssrc]; ok {
-			delete(m.pcmBuffer, ssrc)
-			cleanedCount++
+	if guildBuffers, exists := m.pcmBuffers[guildID]; exists {
+		for _, ssrc := range ssrcs {
+			delete(guildBuffers, ssrc)
 		}
 	}
-	if cleanedCount > 0 {
-		log.Printf("[AudioMixer] Cleaned up buffer resources for %d SSRC(s): %v", cleanedCount, ssrcs)
-	}
 }
 
-// CleanupAllResources は、すべてのリソースをクリーンアップします
+// CleanupAllResources はすべてのリソースをクリーンアップします
 func (m *AudioMixer) CleanupAllResources() {
-	log.Println("[AudioMixer] Cleaning up all resources...")
+	m.pcmBuffersMutex.Lock()
+	m.pcmBuffers = make(map[string]map[uint32][]int16)
+	m.pcmBuffersMutex.Unlock()
 
-	m.bufferMutex.Lock()
-	m.activeGuildMutex.Lock()
-	m.speakingChannelsMutex.Lock()
-	defer m.bufferMutex.Unlock()
-	defer m.activeGuildMutex.Unlock()
-	defer m.speakingChannelsMutex.Unlock()
+	m.encodersMutex.Lock()
+	m.encoders = make(map[string]*gopus.Encoder)
+	m.encodersMutex.Unlock()
 
-	m.pcmBuffer = make(map[uint32][]int16)
-	m.activeGuildSSRC = make(map[string]map[uint32]bool)
-
-	// Speakingチャンネルも全て閉じてクリア
-	for guildID, ch := range m.speakingChannels {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("[AudioMixer] Speaking channel for guild %s was already closed during cleanup", guildID)
-				}
-			}()
-
-			if ch != nil {
-				close(ch)
-				log.Printf("[AudioMixer] Closed speaking channel for guild %s during cleanup", guildID)
-			}
-		}()
-	}
-	m.speakingChannels = make(map[string]chan []byte)
-
-	// エフェクト状態もクリア
-	m.effectProcessor.CleanupAllEffects()
-
-	log.Println("[AudioMixer] All resources cleaned up.")
+	log.Println("[AudioMixer] All resources cleaned up")
 }
 
-// startMixer は、PCMバッファからデータを定期的に読み取り、ミキシングしてエンコードし、適切なSpeakingBotチャネルに送るループを開始します
-func (m *AudioMixer) startMixer() {
-	mixTicker := time.NewTicker(time.Duration(OpusFrameSizeMs) * time.Millisecond)
-	defer mixTicker.Stop()
-	log.Println("[AudioMixer] Starting mixer loop.")
-
-	encoder, err := gopus.NewEncoder(OpusSampleRate, OpusChannels, gopus.Voip)
-	if err != nil {
-		log.Fatalf("[AudioMixer] Failed to create Opus encoder: %v", err)
-		return
-	}
-
-	opusBuffer := make([]byte, 1024) // ループ外で確保して使い回す
+// mixerLoop はミキサーのメインループです
+func (m *AudioMixer) mixerLoop() {
+	ticker := time.NewTicker(time.Duration(MixerTickRate) * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-m.stopMixer:
-			log.Println("[AudioMixer] Received stop signal. Exiting mixer loop.")
+			log.Println("[AudioMixer] Mixer loop stopping...")
 			return
-		case <-mixTicker.C:
-			// ギルドごとにミキシングとエンコードを実行
-			m.mixAndEncodeGuilds(encoder, opusBuffer)
+		case <-ticker.C:
+			m.mixAndEncodeAllGuilds()
 		}
 	}
 }
 
-// mixAndEncodeGuilds は、アクティブなギルドごとにミキシングとエンコードを実行します
-func (m *AudioMixer) mixAndEncodeGuilds(encoder *gopus.Encoder, opusBuffer []byte) {
-	// 処理対象のギルドIDリストを取得
-	m.activeGuildMutex.Lock()
-	guildsToProcess := make([]string, 0, len(m.activeGuildSSRC))
-	for guildID := range m.activeGuildSSRC {
-		guildsToProcess = append(guildsToProcess, guildID)
-	}
-	m.activeGuildMutex.Unlock()
-
-	// 各ギルドについて処理
-	for _, guildID := range guildsToProcess {
-		m.mixAndEncodeSingleGuild(guildID, encoder, opusBuffer)
-	}
-}
-
-// mixAndEncodeSingleGuild は、指定されたギルドのPCMバッファをミキシングし、エンコードして対応するSpeakingチャネルに送信します
-func (m *AudioMixer) mixAndEncodeSingleGuild(guildID string, encoder *gopus.Encoder, opusBuffer []byte) {
-	// このギルドに対応するSpeaking Channelがあるか確認
+// mixAndEncodeAllGuilds はすべてのギルドの音声をミキシングしてエンコードします
+func (m *AudioMixer) mixAndEncodeAllGuilds() {
 	m.speakingChannelsMutex.Lock()
-	speakingCh, exists := m.speakingChannels[guildID]
+	guildIDs := make([]string, 0, len(m.speakingChannels))
+	for guildID := range m.speakingChannels {
+		guildIDs = append(guildIDs, guildID)
+	}
 	m.speakingChannelsMutex.Unlock()
-	if !exists {
-		return // 送信先がない
-	}
 
-	// チャンネルがnilでないことも確認
-	if speakingCh == nil {
-		log.Printf("[AudioMixer:%s] Speaking channel is nil, removing from map", guildID)
-		m.speakingChannelsMutex.Lock()
-		delete(m.speakingChannels, guildID)
-		m.speakingChannelsMutex.Unlock()
+	for _, guildID := range guildIDs {
+		m.mixAndEncodeSingleGuild(guildID)
+	}
+}
+
+// mixAndEncodeSingleGuild は単一ギルドの音声をミキシングしてエンコードします
+func (m *AudioMixer) mixAndEncodeSingleGuild(guildID string) {
+	// PCMバッファからデータを取得
+	m.pcmBuffersMutex.Lock()
+	guildBuffers, exists := m.pcmBuffers[guildID]
+	if !exists || len(guildBuffers) == 0 {
+		m.pcmBuffersMutex.Unlock()
 		return
 	}
 
-	mixedPCM := make([]int16, PCMFrameSize) // 毎回初期化
-	activeStreams := 0
+	// 各SSRCから必要なサンプル数を取得してミキシング
+	mixedPCM := make([]int16, PCMFrameSize*PCMChannels)
+	hasData := false
+	activeSSRCs := 0
 
-	// このギルドに属するSSRCを取得
-	m.activeGuildMutex.Lock()
-	ssrcsInGuild := make([]uint32, 0)
-	if ssrcMap, ok := m.activeGuildSSRC[guildID]; ok {
-		for ssrc := range ssrcMap {
-			ssrcsInGuild = append(ssrcsInGuild, ssrc)
-		}
-	} else {
-		m.activeGuildMutex.Unlock()
-		return
-	}
-	m.activeGuildMutex.Unlock()
+	for ssrc, buffer := range guildBuffers {
+		if len(buffer) >= PCMFrameSize*PCMChannels {
+			hasData = true
+			activeSSRCs++
+			// 必要なサンプル数を取得
+			samples := buffer[:PCMFrameSize*PCMChannels]
+			// バッファから削除
+			guildBuffers[ssrc] = buffer[PCMFrameSize*PCMChannels:]
 
-	if len(ssrcsInGuild) == 0 {
-		return // このギルドにアクティブなSSRCがない
-	}
-
-	m.bufferMutex.Lock()
-	// このギルドのSSRCのバッファから読み出してミキシング
-	for _, ssrc := range ssrcsInGuild {
-		if buffer, ok := m.pcmBuffer[ssrc]; ok && len(buffer) >= PCMFrameSize {
-			activeStreams++
-			for i := 0; i < PCMFrameSize; i++ {
-				sample := int32(mixedPCM[i]) + int32(buffer[i])
-				if sample > 32767 {
-					sample = 32767
-				} else if sample < -32768 {
-					sample = -32768
+			// ミキシング（加算）
+			for i, sample := range samples {
+				mixed := int32(mixedPCM[i]) + int32(sample)
+				// クリッピング防止
+				if mixed > 32767 {
+					mixed = 32767
+				} else if mixed < -32768 {
+					mixed = -32768
 				}
-				mixedPCM[i] = int16(sample)
+				mixedPCM[i] = int16(mixed)
 			}
-			m.pcmBuffer[ssrc] = buffer[PCMFrameSize:] // 読み出した分を削除
 		}
 	}
-	m.bufferMutex.Unlock()
+	m.pcmBuffersMutex.Unlock()
 
-	if activeStreams > 0 {
-		// 音声エフェクトを適用
-		m.effectProcessor.ApplyAudioEffect(guildID, mixedPCM)
+	if !hasData {
+		return
+	}
 
-		encodedOpus, err := encoder.Encode(mixedPCM, PCMFrameSize/OpusChannels, len(opusBuffer))
+	// 音声データが処理されていることをログに記録（頻度を制限）
+	if activeSSRCs > 0 {
+		m.logMutex.Lock()
+		m.logCounter[guildID]++
+		if m.logCounter[guildID]%100 == 1 { // 100回に1回ログ出力
+			log.Printf("[AudioMixer:%s] Processing audio data from %d active sources (count: %d)", guildID, activeSSRCs, m.logCounter[guildID])
+		}
+		m.logMutex.Unlock()
+	}
+
+	// エフェクトを適用
+	if m.speakingBot != nil {
+		effect := m.speakingBot.GetEffect(guildID)
+		if effect != EffectNone {
+			log.Printf("[AudioMixer:%s] Applying effect: %d", guildID, effect)
+		}
+		mixedPCM = m.effectProcessor.ApplyEffect(guildID, effect, mixedPCM)
+	}
+
+	// Opusエンコード
+	opusData, err := m.encodePCMToOpus(guildID, mixedPCM)
+	if err != nil {
+		log.Printf("[AudioMixer:%s] Error encoding PCM to Opus: %v", guildID, err)
+		return
+	}
+
+	// SpeakingBotに送信
+	m.speakingChannelsMutex.Lock()
+	if ch, exists := m.speakingChannels[guildID]; exists {
+		select {
+		case ch <- opusData:
+			// 送信成功
+		default:
+			// チャネルがフル、スキップ
+			log.Printf("[AudioMixer:%s] Speaking channel full, skipping audio data", guildID)
+		}
+	}
+	m.speakingChannelsMutex.Unlock()
+}
+
+// encodePCMToOpus はPCMデータをOpusにエンコードします
+func (m *AudioMixer) encodePCMToOpus(guildID string, pcmData []int16) ([]byte, error) {
+	m.encodersMutex.Lock()
+	encoder, exists := m.encoders[guildID]
+	if !exists {
+		var err error
+		encoder, err = gopus.NewEncoder(OpusSampleRate, OpusChannels, gopus.Audio)
 		if err != nil {
-			log.Printf("[AudioMixer:%s] Failed to encode mixed PCM: %v", guildID, err)
-			return
+			m.encodersMutex.Unlock()
+			return nil, err
 		}
-
-		if len(encodedOpus) > 0 {
-			// 対応するSpeaking Channelに送信 (非ブロッキング)
-			// チャンネルが閉じられている場合のパニックを防止
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("[AudioMixer:%s] Speaking channel was closed, discarding Opus data (%d bytes)", guildID, len(encodedOpus))
-					}
-				}()
-
-				select {
-				case speakingCh <- encodedOpus:
-					// log.Printf("[AudioMixer:%s] Sent %d bytes of Opus data", guildID, len(encodedOpus))
-				default:
-					log.Printf("[AudioMixer:%s] Speaking channel is blocked, discarding Opus data (%d bytes)", guildID, len(encodedOpus))
-				}
-			}()
-		}
+		m.encoders[guildID] = encoder
 	}
+	m.encodersMutex.Unlock()
+
+	return encoder.Encode(pcmData, PCMFrameSize, BufferSize)
 }
